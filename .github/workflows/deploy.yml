@@ -1,0 +1,81 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 */3 * * *'   # refresh GPU prices every 3 hours (GitHub skips some scheduled runs)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment2.outputs.page_url || steps.deployment3.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Pillow (share images)
+        run: pip install pillow==11.3.0
+      - name: Build site
+        run: python3 build.py
+      # Keep the price history: commit the new snapshot (also keeps the scheduled workflow from being disabled).
+      - name: Commit price snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.csv data/pricing-fallback.json
+          if git diff --cached --quiet; then echo "no new snapshot"; exit 0; fi
+          git commit -m "Price snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0; sleep 5; done
+          exit 1
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      # GitHub sometimes doesn't list the just-uploaded artifact yet ("No artifacts named github-pages"),
+      # which failed the run. Try the deploy up to three times, waiting in between.
+      - name: Deploy
+        id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - name: Wait before second deploy attempt
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 20
+      - name: Deploy (second attempt)
+        id: deployment2
+        if: steps.deployment.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - name: Wait before third deploy attempt
+        if: steps.deployment2.outcome == 'failure'
+        run: sleep 60
+      - name: Deploy (third attempt)
+        id: deployment3
+        if: steps.deployment2.outcome == 'failure'
+        uses: actions/deploy-pages@v4
+      # Tell Bing/Yandex/Seznam (IndexNow) about changed pages. Only on push, not on the scheduled price refresh.
+      - name: Ping IndexNow
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, re, urllib.request
+          key = next(os.path.basename(f)[:-4] for f in glob.glob("dist/*.txt") if re.fullmatch(r"[0-9a-f]{32}\.txt", os.path.basename(f)))
+          urls = open("dist/urls.txt").read().split()
+          body = json.dumps({"host": "vastaicode.com", "key": key, "keyLocation": f"https://vastaicode.com/{key}.txt", "urlList": urls}).encode()
+          req = urllib.request.Request("https://api.indexnow.org/indexnow", data=body, headers={"Content-Type": "application/json; charset=utf-8"})
+          print(urllib.request.urlopen(req, timeout=30).status)
+          PY
