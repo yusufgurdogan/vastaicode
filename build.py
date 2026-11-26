@@ -42,7 +42,8 @@ def load_pricing():
         with open(FALLBACK) as f:
             prev = json.load(f)
     try:
-        data = vast.summarize(vast.fetch_offers())
+        known = [m["name"] for m in prev["models"]] if prev else ()
+        data = vast.summarize(*vast.fetch_offers(os.environ.get("VAST_API_KEY"), known))
         if len(data["models"]) < 5:
             raise ValueError(f"only {len(data['models'])} models in the offer search")
         if prev:  # models with nothing free right now keep their last known prices for a while
@@ -50,7 +51,7 @@ def load_pricing():
             have = {m["slug"] for m in data["models"]}
             for m in prev["models"]:
                 if m["slug"] not in have and now - chart.parse_ts(m["last_seen"]) <= dt.timedelta(days=KEEP_DAYS):
-                    data["models"].append({**m, "machines": 0, "gpus": 0, "offers": 0})
+                    data["models"].append({**m, "machines": 0, "gpus": 0})
         data["models"].sort(key=lambda m: m["slug"])
         with open(FALLBACK, "w") as f:
             json.dump(data, f, indent=1, sort_keys=True)
@@ -82,6 +83,11 @@ def art(name):
 
 def plural(n, word):
     return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+
+def mach(n):
+    """'16 machines', or '16+ machines' when the snapshot may have missed some (no API key)."""
+    return plural(n, "machine") if STATE["complete"] else f"{n:,}+ machines"
 
 
 CLASS = {"datacenter": "Data center", "professional": "Workstation", "consumer": "Consumer"}
@@ -197,7 +203,7 @@ def breadcrumbs(items):
 
 
 # Set by main(): whether share images were generated, and when prices were fetched.
-STATE = {"images": False, "modified": None, "hist": {}}
+STATE = {"images": False, "modified": None, "hist": {}, "complete": False}
 
 
 def page(path, title, desc, body, jsonld=None, og=None, og_alt=None, crumbs=None, noindex=False, charts=False):
@@ -282,15 +288,17 @@ def codebox(label="Vast.ai referral link"):
 def avail_text(m):
     if not m["machines"]:
         return "none free right now"
-    return f"{plural(m['gpus'], 'GPU')} free on {plural(m['machines'], 'machine')}"
+    if STATE["complete"]:
+        return f"{plural(m['gpus'], 'GPU')} free on {plural(m['machines'], 'machine')}"
+    return f"{mach(m['machines'])} free, with {m['gpus']:,}+ GPUs"
 
 
 def price_table(models, updated, controls=False):
     rows = []
     for m in models:
         n = m["machines"]
-        status = (f'<span class="pill ok">{plural(n, "machine")}</span>' if n else '<span class="pill">none free</span>')
-        sub_free = (f'<span class="ok-t">{plural(n, "machine")}</span>' if n else 'none free')
+        status = (f'<span class="pill ok">{mach(n)}</span>' if n else '<span class="pill">none free</span>')
+        sub_free = (f'<span class="ok-t">{mach(n)}</span>' if n else 'none free')
         pts = STATE["hist"].get(m["slug"], [])
         if pts:
             cutoff = pts[-1]["t"] - dt.timedelta(days=7)
@@ -327,8 +335,11 @@ def price_table(models, updated, controls=False):
 <tbody>{''.join(rows)}</tbody></table></div>
 <p class="small">From Vast.ai's public offer search, {e(updated)}: verified machines that were free to rent. Prices are for the GPU only,
 per GPU per hour; storage and bandwidth are charged separately. “Interruptible from” is the lowest minimum bid.
-Models with nothing free show the last price we saw.</p>"""
+Models with nothing free show the last price we saw.{'' if STATE['complete'] else SAMPLED_NOTE}</p>"""
 
+
+SAMPLED_NOTE = (" Vast.ai's public search shows only part of the market per request, so we merge many requests: "
+                "machine counts are minimums (“+”), and now and then a cheaper offer exists than the lowest one we found.")
 
 TABLE_JS = """
 <script>
@@ -401,8 +412,10 @@ def build_index(data, models, updated, year):
          "A GPU rental marketplace. Independent hosts, from hobbyists to data centers, list their machines and set their own prices. "
          "You pick an offer, launch a Docker template on it and connect by SSH or Jupyter. There's also a CLI, an API and a serverless product."),
         ("Where do these prices come from?",
-         "From Vast.ai's public offer search, the same data its console shows. About every 3 hours we read all verified machines that are free to rent "
-         "and keep the lowest and median GPU price for each model. Unverified machines and machines that are already rented aren't included."),
+         "From Vast.ai's public offer search, the same data its console shows. About every 3 hours we read the verified machines that are free to rent "
+         "and keep the lowest and median GPU price for each model. Unverified machines and machines that are already rented aren't included."
+         + ("" if STATE["complete"] else " The public search returns only part of the market per request, so we merge many requests; "
+            "a few machines can still be missing, which is why counts are shown with a “+”.")),
         ("Is this site run by Vast.ai?",
          "No. It's an independent site that shares a referral link and a copy of Vast.ai's public prices."),
     ]
@@ -414,7 +427,7 @@ def build_index(data, models, updated, year):
         cards.append(f"<div class='card'><b>{usd(r4090['min'])}/hr</b><span>RTX 4090 from</span></div>")
     if h100:
         cards.append(f"<div class='card'><b>{usd(h100['min'])}/hr</b><span>H100 from ({e(h100['name'])})</span></div>")
-    cards.append(f"<div class='card'><b>{n_machines:,}</b><span>verified machines free now, {len(avail)} GPU models</span></div>")
+    cards.append(f"<div class='card'><b>{n_machines:,}{'' if STATE['complete'] else '+'}</b><span>verified machines free now, {len(avail)} GPU models</span></div>")
 
     body = f"""
 <h1>Vast.ai Referral Code ({year}): link ID {e(REF_ID)}</h1>
@@ -503,7 +516,7 @@ def price_context(name, st):
         parts.append(f"None are free right now. The last available price was {usd(st['last_real']['min'])} "
                      f"on {st['last_real']['t'].strftime('%-d %b')}.")
     so = st["soldout_share"]
-    avail_txt = f"On average {st['avail_avg']:.0f} verified machines with it were free to rent at any time"
+    avail_txt = f"On average we found {st['avail_avg']:.0f} verified machines with it free to rent"
     avail_txt += (f", and none were free in {so * 100:.0f}% of our snapshots." if so >= 0.05 else
                   ", and it was rarely unavailable.")
     parts.append(avail_txt)
@@ -543,7 +556,7 @@ def build_gpu(m, models, updated):
     from_word = "from" if n else "last seen at"
 
     if n:
-        a_price = (f"From {usd(lo)} per GPU-hour on demand" + (f" (median {usd(med)} across {plural(n, 'machine')})" if n > 1 else "")
+        a_price = (f"From {usd(lo)} per GPU-hour on demand" + (f" (median {usd(med)} across {mach(n)})" if n > 1 else "")
                    + f", billed per second. That's about {usd(day)} a day or {usd(month)} for 30 days at the lowest price. "
                    "Storage and bandwidth are charged on top, at rates each host sets.")
         a_avail = (f"At the last update: {status}, in {plural(m['countries'], 'country').replace('countrys', 'countries')}. "
@@ -598,12 +611,13 @@ def build_gpu(m, models, updated):
 <p class="small">Full history for every GPU: <a href="/data/{HISTORY_NAME}">{HISTORY_NAME}</a> (CC BY 4.0, please link back).</p></details>"""
     cards = [f"<div class='card'><b>{usd(lo)}</b><span>{'lowest on-demand price' if n else 'last on-demand price seen'}, per GPU-hour</span></div>"]
     if n > 1:
-        cards.append(f"<div class='card'><b>{usd(med)}</b><span>median across {plural(n, 'machine')}</span></div>")
+        cards.append(f"<div class='card'><b>{usd(med)}</b><span>median across {mach(n)}</span></div>")
     if bid is not None:
         cards.append(f"<div class='card'><b>{usd(bid)}</b><span>interruptible, lowest minimum bid</span></div>")
     cards.append(f"<div class='card'><b>{m['vram_gb']} GB</b><span>VRAM · {e(cls)} GPU</span></div>")
-    cards.append(f"<div class='card'><b>{n}</b><span>{'machine' if n == 1 else 'machines'} free now"
-                 + (f", {plural(m['gpus'], 'GPU')}" if n else "") + "</span></div>")
+    plus = "" if STATE["complete"] or not n else "+"
+    cards.append(f"<div class='card'><b>{n}{plus}</b><span>{'machine' if n == 1 and not plus else 'machines'} free now"
+                 + (f", {m['gpus']:,}{plus} GPU{'' if m['gpus'] == 1 and not plus else 's'}" if n else "") + "</span></div>")
     if n:
         cards.append(f"<div class='card'><b>{usd(month)}</b><span>30 days at the lowest price, GPU only</span></div>")
     body = f"""
@@ -732,6 +746,7 @@ def main():
     if live and chart.append(HISTORY, data):
         print("recorded price snapshot", file=sys.stderr)
     STATE["hist"] = chart.load(HISTORY)
+    STATE["complete"] = bool(data.get("complete"))
     t = chart.parse_ts(data["generated_at"])
     updated = t.strftime("%-d %b %Y, %H:%M UTC")
     year = t.year
@@ -755,7 +770,7 @@ def main():
         og.home(os.path.join(DIST, "og", "home.png"), LINK_TEXT, stats)
         og.pricing(os.path.join(DIST, "og", "pricing.png"), LINK_TEXT)
         for m in models:
-            sub = (f"{plural(m['machines'], 'machine')} free now" if m["machines"] else "none free right now")
+            sub = (f"{mach(m['machines'])} free now" if m["machines"] else "none free right now")
             og.gpu(os.path.join(DIST, "og", "gpu", m["slug"] + ".png"), LINK_TEXT, m["name"], usd(m["min"]), sub, m["vram_gb"])
         og.icons(DIST)
         STATE["images"] = True
@@ -798,7 +813,7 @@ def main():
              f"## GPU prices (USD per GPU-hour, GPU only, verified machines free to rent, {updated})", ""]
     lines += [f"- [{m['name']}]({BASE}/gpu/{m['slug']}): on-demand from {usd(m['min'])}"
               + (f", interruptible from {usd(m['bid'])}" if m["bid"] is not None else "")
-              + f", {m['vram_gb']} GB, {plural(m['machines'], 'machine')} free" for m in models]
+              + f", {m['vram_gb']} GB, {mach(m['machines'])} free" for m in models]
     lines += ["", "## Guides", "",
               f"- [How Vast.ai pricing works]({BASE}/pricing): on-demand, interruptible, reserved, storage and bandwidth"]
     write("llms.txt", "\n".join(lines) + "\n")

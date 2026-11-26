@@ -29,8 +29,13 @@ jobs:
           python-version: '3.12'
       - name: Install Pillow (share images)
         run: pip install pillow==11.3.0
+      # Without VAST_API_KEY the build still works, but needs a few hundred requests (about 6 minutes)
+      # and the snapshot can miss some machines. With the key it is one exact request.
       - name: Build site
         run: python3 build.py
+        timeout-minutes: 20
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
       # Keep the price history: commit the new snapshot (also keeps the scheduled workflow from being disabled).
       - name: Commit price snapshot
         run: |

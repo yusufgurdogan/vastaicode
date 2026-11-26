@@ -1,7 +1,8 @@
 """Fetch a snapshot of Vast.ai's public marketplace offers and summarize it per GPU model.
 
-Uses the same unauthenticated offer search the Vast console uses. It returns at most 64 offers
-per request, so we walk the whole market in price order.
+Uses Vast.ai's offer search. With an API key (VAST_API_KEY) one request returns everything.
+Without a key the search returns at most 64 offers per request, and a different part of the market
+each time, so the snapshot is merged from many requests and is close to complete, not exact.
 """
 import collections
 import datetime as dt
@@ -16,54 +17,75 @@ import urllib.request
 
 SEARCH_URL = "https://console.vast.ai/api/v0/bundles/"
 UA = "gpu-price-site-builder/1.0"
-PAGE = 64          # server-side cap for requests without an API key
-MAX_REQUESTS = 400
-PAUSE = 0.6        # seconds between requests
+CAP = 64            # most offers one request returns without an API key
+ROUNDS = 2          # without a key every request returns a different part of the market, so ask more than once
+MAX_REQUESTS = 450
+PAUSE = 1.3         # seconds between requests (faster gets HTTP 429)
+BASE_QUERY = {"verified": {"eq": True}, "rentable": {"eq": True}, "rented": {"eq": False}, "type": "on-demand"}
+
+_count = 0
 
 
-def _get(query):
+def _get(query, api_key=None):
+    global _count
     url = SEARCH_URL + "?q=" + urllib.parse.quote(json.dumps(query))
-    for attempt in range(5):
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    for attempt in range(6):
+        _count += 1
+        if _count > MAX_REQUESTS:
+            raise RuntimeError("too many requests to the offer search")
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=90) as r:
                 return json.load(r)["offers"]
         except urllib.error.HTTPError as ex:
-            if ex.code not in (429, 500, 502, 503, 504) or attempt == 4:
-                raise
-            time.sleep(3 * (attempt + 1))
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == 4:
-                raise
-            time.sleep(3 * (attempt + 1))
+            if ex.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                raise RuntimeError(f"offer search answered HTTP {ex.code}") from None  # never echo the request
+            time.sleep(8 * (attempt + 1))
+        except (urllib.error.URLError, TimeoutError) as ex:
+            if attempt == 5:
+                raise RuntimeError(f"offer search unreachable: {getattr(ex, 'reason', ex)}") from None
+            time.sleep(8 * (attempt + 1))
 
 
-def fetch_offers():
-    """All verified, currently rentable on-demand offers. Pages by price because there is no offset."""
-    base = {"verified": {"eq": True}, "rentable": {"eq": True}, "rented": {"eq": False}, "type": "on-demand",
-            "order": [["dph_total", "asc"]], "limit": PAGE}
-    seen, floor, n = {}, None, 0
-    while n < MAX_REQUESTS:
-        query = dict(base)
-        if floor is not None:
-            query["dph_total"] = {"gte": floor}
-        page = _get(query)
-        n += 1
-        new = [o for o in page if o["id"] not in seen]
-        for o in new:
-            seen[o["id"]] = o
-        if len(page) < PAGE:
-            break
-        top = max(o["dph_total"] for o in page)
-        if not new or top == floor:
-            # A whole page at one price: step just past it (we may miss a few identical offers).
-            top = (floor if floor is not None else top) + 1e-6
-        floor = top
+def _walk(extra, out):
+    """Collect offers matching `extra`, splitting the price range wherever a request comes back full."""
+    def rec(lo, hi):
+        page = _get({**BASE_QUERY, **extra, "dph_total": {"gte": lo, "lt": hi}, "limit": CAP})
         time.sleep(PAUSE)
-    else:
-        raise RuntimeError("offer search did not finish")
-    print(f"vast: {len(seen)} offers in {n} requests", file=sys.stderr)
-    return list(seen.values())
+        out.extend(page)
+        if len(page) >= CAP and hi - lo > 1e-3:
+            mid = (lo + hi) / 2 if lo > 0 else hi / 8
+            rec(lo, mid)
+            rec(mid, hi)
+    rec(0, 4000)
+
+
+def fetch_offers(api_key=None, known_names=()):
+    """Verified, currently rentable on-demand offers. Returns (offers, complete).
+
+    With an API key one request returns the whole market (complete=True).
+    Without one, Vast.ai returns at most 64 offers per request and a different subset every time, so we
+    ask per GPU model, several times, and merge. That finds most machines but not provably all of them.
+    """
+    global _count
+    _count = 0
+    if api_key:
+        offers = _get({**BASE_QUERY, "limit": 20000}, api_key)
+        if len(offers) > CAP:
+            print(f"vast: {len(offers)} offers with API key", file=sys.stderr)
+            return offers, True
+        print("vast: API key request returned a capped result; using the keyless method", file=sys.stderr)
+    found = []
+    _walk({}, found)
+    names = sorted({o["gpu_name"] for o in found if o.get("gpu_name")} | set(known_names))
+    for _ in range(ROUNDS):
+        for name in names:
+            _walk({"gpu_name": {"eq": name}}, found)
+    print(f"vast: {len(found)} offer rows, {len({o['machine_id'] for o in found})} machines, "
+          f"{len(names)} models in {_count} requests (no API key)", file=sys.stderr)
+    return found, False
 
 
 def slugify(name):
@@ -79,42 +101,50 @@ def gpu_class(name):
     return "datacenter"         # H100, A100, L40S, B200, Tesla ...
 
 
-def summarize(offers, now=None):
-    """-> {"generated_at", "market": {...}, "models": [...]} with prices in USD per GPU-hour."""
+def summarize(offers, complete=False, now=None):
+    """-> {"generated_at", "complete", "market": {...}, "models": [...]} with prices in USD per GPU-hour.
+
+    A machine can show up as several offers (different slices of its GPUs, or the same one fetched twice):
+    each machine counts once, at its lowest price per GPU."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    by = collections.defaultdict(list)
+    by = collections.defaultdict(dict)
     for o in offers:
-        if o.get("gpu_name") and o.get("num_gpus") and o.get("dph_base"):
-            by[o["gpu_name"]].append(o)
+        if not (o.get("gpu_name") and o.get("num_gpus") and o.get("dph_base")):
+            continue
+        m = by[o["gpu_name"]].setdefault(o["machine_id"], {"price": None, "bid": None, "gpus": 0, "o": o})
+        price = o["dph_base"] / o["num_gpus"]
+        if m["price"] is None or price < m["price"]:
+            m["price"], m["o"] = price, o
+        if o.get("min_bid"):
+            bid = o["min_bid"] / o["num_gpus"]
+            m["bid"] = bid if m["bid"] is None else min(m["bid"], bid)
+        m["gpus"] = max(m["gpus"], o["num_gpus"])
     models = []
-    for name, lst in by.items():
-        price = sorted(o["dph_base"] / o["num_gpus"] for o in lst)
-        bids = [o["min_bid"] / o["num_gpus"] for o in lst if o.get("min_bid")]
-        machines = {}
-        for o in lst:  # one machine can appear as several offers (slices of its GPUs)
-            machines[o["machine_id"]] = max(machines.get(o["machine_id"], 0), o["num_gpus"])
-        vram = collections.Counter(round(o["gpu_ram"] / 1024) for o in lst).most_common(1)[0][0]
-        dc = [o["dph_base"] / o["num_gpus"] for o in lst if o.get("hosting_type") == 1]
-        best = min(lst, key=lambda o: o["dph_base"] / o["num_gpus"])
+    for name, machines in by.items():
+        lst = sorted(machines.values(), key=lambda m: m["price"])
+        price = [m["price"] for m in lst]
+        bids = [m["bid"] for m in lst if m["bid"] is not None]
+        vram = collections.Counter(round(m["o"]["gpu_ram"] / 1024) for m in lst).most_common(1)[0][0]
+        dc = [m["price"] for m in lst if m["o"].get("hosting_type") == 1]
         models.append({
             "name": name, "slug": slugify(name), "gpu_class": gpu_class(name), "vram_gb": vram,
             "min": round(price[0], 4), "median": round(statistics.median(price), 4), "max": round(price[-1], 4),
             "bid": round(min(bids), 4) if bids else None,
             "dc_min": round(min(dc), 4) if dc else None,
-            "machines": len(machines), "gpus": sum(machines.values()), "offers": len(lst),
-            "max_gpus": max(o["num_gpus"] for o in lst),
-            "countries": len({(o.get("geolocation") or "").split(",")[-1].strip() for o in lst} - {""}),
-            "best_location": best.get("geolocation") or None,
+            "machines": len(lst), "gpus": sum(m["gpus"] for m in lst),
+            "max_gpus": max(m["gpus"] for m in lst),
+            "countries": len({(m["o"].get("geolocation") or "").split(",")[-1].strip() for m in lst} - {""}),
+            "best_location": lst[0]["o"].get("geolocation") or None,
             "last_seen": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
-    market = {"offers": len(offers), "machines": len({o["machine_id"] for o in offers}),
-              "gpus": sum(m["gpus"] for m in models), "models": len(models)}
-    return {"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "unit": "USD per GPU-hour", "market": market,
-            "models": models}
+    market = {"machines": sum(m["machines"] for m in models), "gpus": sum(m["gpus"] for m in models), "models": len(models)}
+    return {"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "unit": "USD per GPU-hour", "complete": complete,
+            "market": market, "models": models}
 
 
 if __name__ == "__main__":
-    data = summarize(fetch_offers())
-    print(json.dumps(data["market"]))
-    for m in sorted(data["models"], key=lambda m: -m["machines"]):
-        print(f"{m['name']:22} {m['gpu_class']:12} {m['vram_gb']:4}GB min={m['min']:<7} med={m['median']:<7} bid={m['bid']} dc={m['dc_min']} machines={m['machines']} gpus={m['gpus']} countries={m['countries']}")
+    import os
+    data = summarize(*fetch_offers(os.environ.get("VAST_API_KEY")))
+    print(json.dumps(data["market"]), "complete" if data["complete"] else "sampled")
+    for m in sorted(data["models"], key=lambda m: -m["machines"])[:40]:
+        print(f"{m['name']:22} {m['vram_gb']:4}GB min={m['min']:<7} med={m['median']:<7} bid={m['bid']} machines={m['machines']} gpus={m['gpus']}")
